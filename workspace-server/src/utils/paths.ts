@@ -8,6 +8,9 @@ import path from 'node:path';
 import * as fs from 'node:fs';
 
 function findProjectRoot(): string {
+  const override = process.env.GEMINI_WORKSPACE_DATA_DIR;
+  if (override) return override;
+
   let dir = __dirname;
   while (dir !== path.dirname(dir)) {
     if (fs.existsSync(path.join(dir, 'gemini-extension.json'))) {

@@ -598,12 +598,20 @@ async function main() {
     'calendar.createEvent',
     {
       description:
-        "Creates a new event in a calendar. Supports optional Google Meet link generation and Google Drive file attachments. When addGoogleMeet is true, the Meet URL will be in the response's hangoutLink field. Attachments fully replace any existing attachments.",
+        "Creates a new event in a calendar. Supports regular events, focus time, out-of-office, and working location event types. Use 'date' for all-day events or 'dateTime' for timed events. Supports optional Google Meet link generation and Google Drive file attachments. When addGoogleMeet is true, the Meet URL will be in the response's hangoutLink field. Attachments fully replace any existing attachments.",
       inputSchema: {
         calendarId: z
           .string()
-          .describe('The ID of the calendar to create the event in.'),
-        summary: z.string().describe('The summary or title of the event.'),
+          .optional()
+          .describe(
+            'The ID of the calendar to create the event in. Defaults to the primary calendar.',
+          ),
+        summary: z
+          .string()
+          .optional()
+          .describe(
+            'The summary or title of the event. Defaults based on eventType: "Focus Time", "Out of Office", "Working Location".',
+          ),
         description: z
           .string()
           .optional()
@@ -611,15 +619,29 @@ async function main() {
         start: z.object({
           dateTime: z
             .string()
+            .optional()
             .describe(
-              'The start time in strict ISO 8601 format with seconds and timezone (e.g., 2024-01-15T10:30:00Z or 2024-01-15T10:30:00-05:00).',
+              'The start time in strict ISO 8601 format with seconds and timezone (e.g., 2024-01-15T10:30:00Z or 2024-01-15T10:30:00-05:00). Use for timed events.',
+            ),
+          date: z
+            .string()
+            .optional()
+            .describe(
+              'The start date in YYYY-MM-DD format. Use for all-day events.',
             ),
         }),
         end: z.object({
           dateTime: z
             .string()
+            .optional()
             .describe(
-              'The end time in strict ISO 8601 format with seconds and timezone (e.g., 2024-01-15T11:30:00Z or 2024-01-15T11:30:00-05:00).',
+              'The end time in strict ISO 8601 format with seconds and timezone (e.g., 2024-01-15T11:30:00Z or 2024-01-15T11:30:00-05:00). Use for timed events.',
+            ),
+          date: z
+            .string()
+            .optional()
+            .describe(
+              'The end date in YYYY-MM-DD format. Use for all-day events (exclusive, so use next day).',
             ),
         }),
         attendees: z
@@ -633,6 +655,93 @@ async function main() {
             'Whether to send notifications to attendees. Defaults to "all" if attendees are provided, otherwise "none".',
           ),
         ...eventMeetAndAttachmentsSchema,
+        eventType: z
+          .enum(['default', 'focusTime', 'outOfOffice', 'workingLocation'])
+          .optional()
+          .describe(
+            'The type of event to create. Defaults to "default" (regular event).',
+          ),
+        focusTimeProperties: z
+          .object({
+            chatStatus: z
+              .enum(['available', 'doNotDisturb'])
+              .optional()
+              .describe(
+                'Chat status during focus time. Defaults to "doNotDisturb".',
+              ),
+            autoDeclineMode: z
+              .enum([
+                'declineNone',
+                'declineAllConflictingInvitations',
+                'declineOnlyNewConflictingInvitations',
+              ])
+              .optional()
+              .describe(
+                'How to handle conflicting meeting invitations. Defaults to "declineOnlyNewConflictingInvitations".',
+              ),
+            declineMessage: z
+              .string()
+              .optional()
+              .describe('Message to send when auto-declining meetings.'),
+          })
+          .optional()
+          .describe(
+            'Focus time properties. Only used when eventType is "focusTime".',
+          ),
+        outOfOfficeProperties: z
+          .object({
+            autoDeclineMode: z
+              .enum([
+                'declineNone',
+                'declineAllConflictingInvitations',
+                'declineOnlyNewConflictingInvitations',
+              ])
+              .optional()
+              .describe(
+                'How to handle conflicting meeting invitations. Defaults to "declineOnlyNewConflictingInvitations".',
+              ),
+            declineMessage: z
+              .string()
+              .optional()
+              .describe('Message to send when auto-declining meetings.'),
+          })
+          .optional()
+          .describe(
+            'Out-of-office properties. Only used when eventType is "outOfOffice".',
+          ),
+        workingLocationProperties: z
+          .object({
+            type: z
+              .enum(['homeOffice', 'officeLocation', 'customLocation'])
+              .describe('The type of working location.'),
+            officeLocation: z
+              .object({
+                buildingId: z
+                  .string()
+                  .optional()
+                  .describe('The building ID from the directory.'),
+                label: z
+                  .string()
+                  .optional()
+                  .describe('Label for the office location.'),
+              })
+              .optional()
+              .describe(
+                'Office location details. Required when type is "officeLocation".',
+              ),
+            customLocation: z
+              .object({
+                label: z.string().describe('Label for the custom location.'),
+              })
+              .optional()
+              .describe(
+                'Custom location details. Required when type is "customLocation".',
+              ),
+          })
+          .optional()
+          .describe(
+            'Working location properties. Only used when eventType is "workingLocation".',
+          ),
       },
     },
     calendarService.createEvent,
@@ -660,6 +769,21 @@ async function main() {
           .array(z.string())
           .optional()
           .describe('The response status of the attendee.'),
+        eventTypes: z
+          .array(
+            z.enum([
+              'default',
+              'focusTime',
+              'outOfOffice',
+              'workingLocation',
+              'birthday',
+              'fromGmail',
+            ]),
+          )
+          .optional()
+          .describe(
+            'Filter by event types. Possible values: default, focusTime, outOfOffice, workingLocation, birthday, fromGmail.',
+          ),
       },
       ...readOnlyToolProps,
     },

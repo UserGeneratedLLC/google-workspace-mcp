@@ -21,16 +21,45 @@ interface EventAttachment {
   mimeType?: string;
 }
 
+export type CalendarEventType =
+  | 'default'
+  | 'focusTime'
+  | 'outOfOffice'
+  | 'workingLocation';
+
+export type ListEventsEventType = CalendarEventType | 'birthday' | 'fromGmail';
+
 export interface CreateEventInput {
   calendarId?: string;
-  summary: string;
+  summary?: string;
   description?: string;
-  start: { dateTime: string };
-  end: { dateTime: string };
+  start: { dateTime?: string; date?: string };
+  end: { dateTime?: string; date?: string };
   attendees?: string[];
   sendUpdates?: 'all' | 'externalOnly' | 'none';
   addGoogleMeet?: boolean;
   attachments?: EventAttachment[];
+  eventType?: CalendarEventType;
+  focusTimeProperties?: {
+    chatStatus?: 'available' | 'doNotDisturb';
+    autoDeclineMode?:
+      | 'declineNone'
+      | 'declineAllConflictingInvitations'
+      | 'declineOnlyNewConflictingInvitations';
+    declineMessage?: string;
+  };
+  outOfOfficeProperties?: {
+    autoDeclineMode?:
+      | 'declineNone'
+      | 'declineAllConflictingInvitations'
+      | 'declineOnlyNewConflictingInvitations';
+    declineMessage?: string;
+  };
+  workingLocationProperties?: {
+    type: 'homeOffice' | 'officeLocation' | 'customLocation';
+    officeLocation?: { buildingId?: string; label?: string };
+    customLocation?: { label: string };
+  };
 }
 
 export interface ListEventsInput {
@@ -38,6 +67,7 @@ export interface ListEventsInput {
   timeMin?: string;
   timeMax?: string;
   attendeeResponseStatus?: string[];
+  eventTypes?: ListEventsEventType[];
 }
 
 export interface GetEventInput {
@@ -55,8 +85,8 @@ export interface UpdateEventInput {
   calendarId?: string;
   summary?: string;
   description?: string;
-  start?: { dateTime: string };
-  end?: { dateTime: string };
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
   attendees?: string[];
   addGoogleMeet?: boolean;
   attachments?: EventAttachment[];
@@ -208,7 +238,6 @@ export class CalendarService {
   createEvent = async (input: CreateEventInput) => {
     const {
       calendarId,
-      summary,
       description,
       start,
       end,
@@ -216,12 +245,73 @@ export class CalendarService {
       sendUpdates,
       addGoogleMeet,
       attachments,
+      eventType,
+      focusTimeProperties,
+      outOfOfficeProperties,
+      workingLocationProperties,
     } = input;
 
-    // Validate datetime formats
+    // Apply default summary based on event type
+    const summaryDefaults: Record<string, string> = {
+      focusTime: 'Focus Time',
+      outOfOffice: 'Out of Office',
+      workingLocation: 'Working Location',
+    };
+    const summary =
+      input.summary ?? (eventType ? summaryDefaults[eventType] : undefined);
+
+    // Validate start/end: at least one of dateTime or date must be provided
+    if ((!start.dateTime && !start.date) || (!end.dateTime && !end.date)) {
+      return this.createValidationErrorResponse(
+        new z.ZodError([
+          {
+            code: 'custom',
+            message:
+              'start and end must each have either "dateTime" (for timed events) or "date" (for all-day events)',
+            path: ['start/end'],
+          },
+        ]),
+      );
+    }
+
+    // Focus time and out-of-office cannot be all-day events (Google Calendar API constraint)
+    if (
+      (eventType === 'focusTime' || eventType === 'outOfOffice') &&
+      (start.date || end.date)
+    ) {
+      return this.createValidationErrorResponse(
+        new z.ZodError([
+          {
+            code: 'custom',
+            message: `${eventType} events cannot be all-day events; use dateTime instead of date`,
+            path: ['start/end'],
+          },
+        ]),
+      );
+    }
+
+    // workingLocationProperties is required when eventType is workingLocation
+    if (eventType === 'workingLocation' && !workingLocationProperties) {
+      return this.createValidationErrorResponse(
+        new z.ZodError([
+          {
+            code: 'custom',
+            message:
+              'workingLocationProperties is required when eventType is "workingLocation"',
+            path: ['workingLocationProperties'],
+          },
+        ]),
+      );
+    }
+
+    // Validate datetime formats (skip for date-only / all-day events)
     try {
-      iso8601DateTimeSchema.parse(start.dateTime);
-      iso8601DateTimeSchema.parse(end.dateTime);
+      if (start.dateTime) {
+        iso8601DateTimeSchema.parse(start.dateTime);
+      }
+      if (end.dateTime) {
+        iso8601DateTimeSchema.parse(end.dateTime);
+      }
       if (attendees) {
         emailArraySchema.parse(attendees);
       }
@@ -232,9 +322,10 @@ export class CalendarService {
     const finalCalendarId = calendarId || (await this.getPrimaryCalendarId());
     logToFile(`Creating event in calendar: ${finalCalendarId}`);
     logToFile(`Event summary: ${summary}`);
+    if (eventType) logToFile(`Event type: ${eventType}`);
     if (description) logToFile(`Event description: ${description}`);
-    logToFile(`Event start: ${start.dateTime}`);
-    logToFile(`Event end: ${end.dateTime}`);
+    logToFile(`Event start: ${start.dateTime || start.date}`);
+    logToFile(`Event end: ${end.dateTime || end.date}`);
     logToFile(`Event attendees: ${attendees?.join(', ')}`);
     if (addGoogleMeet) logToFile('Adding Google Meet link');
     if (attachments?.length)
@@ -257,6 +348,64 @@ export class CalendarService {
         end,
         attendees: attendees?.map((email) => ({ email })),
       };
+
+      // Set event type and type-specific properties
+      if (eventType && eventType !== 'default') {
+        event.eventType = eventType;
+      }
+
+      if (eventType === 'focusTime') {
+        event.transparency = 'opaque';
+        event.focusTimeProperties = {
+          chatStatus: focusTimeProperties?.chatStatus ?? 'doNotDisturb',
+          autoDeclineMode:
+            focusTimeProperties?.autoDeclineMode ??
+            'declineOnlyNewConflictingInvitations',
+        };
+        if (focusTimeProperties?.declineMessage !== undefined) {
+          event.focusTimeProperties.declineMessage =
+            focusTimeProperties.declineMessage;
+        }
+      } else if (eventType === 'outOfOffice') {
+        event.transparency = 'opaque';
+        event.outOfOfficeProperties = {
+          autoDeclineMode:
+            outOfOfficeProperties?.autoDeclineMode ??
+            'declineOnlyNewConflictingInvitations',
+        };
+        if (outOfOfficeProperties?.declineMessage !== undefined) {
+          event.outOfOfficeProperties.declineMessage =
+            outOfOfficeProperties.declineMessage;
+        }
+      } else if (eventType === 'workingLocation') {
+        // workingLocationProperties is guaranteed non-null by validation above
+        const wlInput = workingLocationProperties!;
+        event.visibility = 'public';
+        event.transparency = 'transparent';
+
+        const wlProps: calendar_v3.Schema$EventWorkingLocationProperties = {
+          type: wlInput.type,
+        };
+        if (wlInput.type === 'homeOffice') {
+          wlProps.homeOffice = {};
+        } else if (
+          wlInput.type === 'officeLocation' &&
+          wlInput.officeLocation
+        ) {
+          wlProps.officeLocation = {
+            buildingId: wlInput.officeLocation.buildingId,
+            label: wlInput.officeLocation.label,
+          };
+        } else if (
+          wlInput.type === 'customLocation' &&
+          wlInput.customLocation
+        ) {
+          wlProps.customLocation = {
+            label: wlInput.customLocation.label,
+          };
+        }
+        event.workingLocationProperties = wlProps;
+      }
 
       const calendar = await this.getCalendar();
       const insertParams: calendar_v3.Params$Resource$Events$Insert = {
@@ -301,6 +450,7 @@ export class CalendarService {
       calendarId,
       timeMin = new Date().toISOString(),
       attendeeResponseStatus = ['accepted', 'tentative', 'needsAction'],
+      eventTypes,
     } = input;
 
     let timeMax = input.timeMax;
@@ -314,17 +464,26 @@ export class CalendarService {
     logToFile(`Listing events for calendar: ${finalCalendarId}`);
     try {
       const calendar = await this.getCalendar();
-      const res = await calendar.events.list({
+      const listParams: calendar_v3.Params$Resource$Events$List = {
         calendarId: finalCalendarId,
         timeMin,
         timeMax,
         singleEvents: true,
         fields:
-          'items(id,summary,start,end,description,htmlLink,attendees,status)',
-      });
+          'items(id,summary,start,end,description,htmlLink,attendees,status,eventType,focusTimeProperties,outOfOfficeProperties,workingLocationProperties)',
+      };
+      if (eventTypes && eventTypes.length > 0) {
+        listParams.eventTypes = eventTypes;
+      }
+      const res = await calendar.events.list(listParams);
 
       const events = res.data.items
-        ?.filter((event) => event.status !== 'cancelled' && !!event.summary)
+        ?.filter(
+          (event) =>
+            event.status !== 'cancelled' &&
+            (!!event.summary ||
+              (event.eventType && event.eventType !== 'default')),
+        )
         .filter((event) => {
           if (!event.attendees || event.attendees.length === 0) {
             return true; // No attendees, so we can't filter, include it

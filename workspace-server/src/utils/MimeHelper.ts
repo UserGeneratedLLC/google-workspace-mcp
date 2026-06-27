@@ -60,11 +60,15 @@ export class MimeHelper {
     }
 
     if (inReplyTo) {
-      messageParts.push(`In-Reply-To: ${inReplyTo}`);
+      messageParts.push(
+        `In-Reply-To: ${MimeHelper.sanitizeHeaderValue(inReplyTo)}`,
+      );
     }
 
     if (references) {
-      messageParts.push(`References: ${references}`);
+      messageParts.push(
+        `References: ${MimeHelper.sanitizeHeaderValue(references)}`,
+      );
     }
 
     messageParts.push(`Subject: ${utf8Subject}`);
@@ -93,6 +97,28 @@ export class MimeHelper {
   }
 
   /**
+   * Strips characters that would allow MIME header injection from a header
+   * value: CR, LF, and all other C0 control characters, plus DEL (0x7f).
+   * The explicit \r\n in the regex is redundant with \x00-\x1f but kept to
+   * make the header-injection intent obvious.
+   */
+  private static sanitizeHeaderValue(value: string): string {
+    return value.replace(/[\r\n\x00-\x1f\x7f]/g, '');
+  }
+
+  /**
+   * Sanitizes a filename for safe use inside a quoted Content-Disposition
+   * filename parameter: removes control characters (preventing header
+   * injection) and escapes backslashes and double quotes (preventing
+   * parameter injection / early quote termination).
+   */
+  private static sanitizeHeaderFilename(filename: string): string {
+    return MimeHelper.sanitizeHeaderValue(filename)
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"');
+  }
+
+  /**
    * Creates a MIME message with attachments
    */
   public static createMimeMessageWithAttachments({
@@ -102,6 +128,9 @@ export class MimeHelper {
     from,
     cc,
     bcc,
+    replyTo,
+    inReplyTo,
+    references,
     attachments,
     isHtml = false,
   }: {
@@ -111,6 +140,9 @@ export class MimeHelper {
     from?: string;
     cc?: string;
     bcc?: string;
+    replyTo?: string;
+    inReplyTo?: string;
+    references?: string;
     attachments?: Array<{
       filename: string;
       content: Buffer | string;
@@ -134,6 +166,9 @@ export class MimeHelper {
     if (bcc) {
       messageParts.push(`Bcc: ${bcc}`);
     }
+    if (replyTo) {
+      messageParts.push(`Reply-To: ${replyTo}`);
+    }
     messageParts.push(`Subject: ${utf8Subject}`);
     messageParts.push('MIME-Version: 1.0');
 
@@ -146,11 +181,24 @@ export class MimeHelper {
         from,
         cc,
         bcc,
+        replyTo,
+        inReplyTo,
+        references,
         isHtml,
       });
     }
 
     // Multipart message with attachments
+    if (inReplyTo) {
+      messageParts.push(
+        `In-Reply-To: ${MimeHelper.sanitizeHeaderValue(inReplyTo)}`,
+      );
+    }
+    if (references) {
+      messageParts.push(
+        `References: ${MimeHelper.sanitizeHeaderValue(references)}`,
+      );
+    }
     messageParts.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
     messageParts.push('');
 
@@ -166,13 +214,17 @@ export class MimeHelper {
 
     // Attachments
     for (const attachment of attachments) {
-      messageParts.push(`--${boundary}`);
-      messageParts.push(
-        `Content-Type: ${attachment.contentType || 'application/octet-stream'}`,
+      const safeContentType = MimeHelper.sanitizeHeaderValue(
+        attachment.contentType || 'application/octet-stream',
       );
+      const safeFilename = MimeHelper.sanitizeHeaderFilename(
+        attachment.filename,
+      );
+      messageParts.push(`--${boundary}`);
+      messageParts.push(`Content-Type: ${safeContentType}`);
       messageParts.push('Content-Transfer-Encoding: base64');
       messageParts.push(
-        `Content-Disposition: attachment; filename="${attachment.filename}"`,
+        `Content-Disposition: attachment; filename="${safeFilename}"`,
       );
       messageParts.push('');
 

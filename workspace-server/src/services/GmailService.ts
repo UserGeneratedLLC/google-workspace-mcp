@@ -16,7 +16,59 @@ import {
   GMAIL_NO_LABEL_CHANGES_MESSAGE,
 } from '../utils/constants';
 import { gaxiosOptions } from '../utils/GaxiosConfig';
-import { emailArraySchema } from '../utils/validation';
+import { emailArraySchema, gmailAttachmentSchema } from '../utils/validation';
+import { z, ZodError } from 'zod';
+
+// Extension to MIME type map for common file types
+const EXTENSION_MIME_MAP: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx':
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx':
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.zip': 'application/zip',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.mp4': 'video/mp4',
+  '.mp3': 'audio/mpeg',
+};
+
+// Maximum total raw (pre-encoding) size for all attachments, checked against
+// the bytes on disk. Gmail's 25MB limit applies to the entire MIME message,
+// and base64 encoding inflates binary data by ~33%: 18MB of raw bytes becomes
+// ~24MB after encoding, leaving ~1MB of headroom under the 25MB cap for
+// message headers and body.
+const MAX_TOTAL_ATTACHMENT_SIZE_BYTES = 18 * 1024 * 1024;
+
+function assertWithinAttachmentSizeLimit(totalSize: number): void {
+  if (totalSize > MAX_TOTAL_ATTACHMENT_SIZE_BYTES) {
+    throw new Error(
+      `Total attachment size (${(totalSize / 1024 / 1024).toFixed(2)}MB) exceeds the maximum allowed limit of ${MAX_TOTAL_ATTACHMENT_SIZE_BYTES / 1024 / 1024}MB.`,
+    );
+  }
+}
+
+function getMimeTypeFromExtension(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  return EXTENSION_MIME_MAP[ext] ?? 'application/octet-stream';
+}
+
+// Derived from the shared zod schema (also used for the MCP tool input in
+// index.ts) so the runtime validation and this type cannot drift apart.
+type AttachmentInput = z.infer<typeof gmailAttachmentSchema>;
 
 // Type definitions for email parameters
 type SendEmailParams = {
@@ -25,11 +77,13 @@ type SendEmailParams = {
   body: string;
   cc?: string | string[];
   bcc?: string | string[];
+  replyTo?: string;
   isHtml?: boolean;
 };
 
 type CreateDraftParams = SendEmailParams & {
   threadId?: string;
+  attachments?: AttachmentInput[];
 };
 
 interface GmailAttachment {
@@ -410,33 +464,69 @@ export class GmailService {
     }
   };
 
+  /**
+   * Validates recipient email addresses shared by send and createDraft.
+   * Returns a structured error response when validation fails, or null when
+   * all provided addresses are valid.
+   */
+  private validateEmailAddresses({
+    to,
+    cc,
+    bcc,
+    replyTo,
+  }: {
+    to: string | string[];
+    cc?: string | string[];
+    bcc?: string | string[];
+    replyTo?: string;
+  }) {
+    try {
+      emailArraySchema.parse(to);
+      if (cc) emailArraySchema.parse(cc);
+      if (bcc) emailArraySchema.parse(bcc);
+      if (replyTo) emailArraySchema.parse(replyTo);
+      return null;
+    } catch (error) {
+      // Only Zod validation failures mean the addresses were malformed;
+      // anything else is an internal fault and must not be mislabeled as an
+      // invalid-email error, so rethrow it for the caller's generic handler.
+      if (!(error instanceof ZodError)) {
+        throw error;
+      }
+      logToFile(`Rejected invalid email address input: ${error.message}`);
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              error: 'Invalid email address format',
+              details: error.message,
+            }),
+          },
+        ],
+      };
+    }
+  }
+
   public send = async ({
     to,
     subject,
     body,
     cc,
     bcc,
+    replyTo,
     isHtml = false,
   }: SendEmailParams) => {
     try {
       // Validate email addresses
-      try {
-        emailArraySchema.parse(to);
-        if (cc) emailArraySchema.parse(cc);
-        if (bcc) emailArraySchema.parse(bcc);
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                error: 'Invalid email address format',
-                details:
-                  error instanceof Error ? error.message : 'Validation failed',
-              }),
-            },
-          ],
-        };
+      const validationError = this.validateEmailAddresses({
+        to,
+        cc,
+        bcc,
+        replyTo,
+      });
+      if (validationError) {
+        return validationError;
       }
 
       logToFile(`Sending email to: ${to}, subject: ${subject}`);
@@ -448,6 +538,7 @@ export class GmailService {
         body,
         cc: cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : undefined,
         bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
+        replyTo,
         isHtml,
       });
 
@@ -489,10 +580,23 @@ export class GmailService {
     body,
     cc,
     bcc,
+    replyTo,
     isHtml = false,
     threadId,
+    attachments,
   }: CreateDraftParams) => {
     try {
+      // Validate email addresses
+      const validationError = this.validateEmailAddresses({
+        to,
+        cc,
+        bcc,
+        replyTo,
+      });
+      if (validationError) {
+        return validationError;
+      }
+
       logToFile(`Creating draft - to: ${to}, subject: ${subject}`);
 
       const gmail = await this.getGmailClient();
@@ -534,16 +638,92 @@ export class GmailService {
       }
 
       // Create MIME message
-      const mimeMessage = MimeHelper.createMimeMessage({
-        to: Array.isArray(to) ? to.join(', ') : to,
-        subject,
-        body,
-        cc: cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : undefined,
-        bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
-        isHtml,
-        inReplyTo,
-        references,
-      });
+      let mimeMessage: string;
+
+      if (attachments && attachments.length > 0) {
+        // Validate all paths are absolute and check file sizes before reading anything
+        const attachmentSizes = await Promise.all(
+          attachments.map(async (att) => {
+            if (!path.isAbsolute(att.filePath)) {
+              throw new Error(
+                `Attachment filePath must be an absolute path: ${att.filePath}`,
+              );
+            }
+
+            let stats;
+            try {
+              stats = await fs.stat(att.filePath);
+            } catch (statError) {
+              throw new Error(
+                `Could not access attachment file ${att.filePath}: ${statError instanceof Error ? statError.message : String(statError)}`,
+              );
+            }
+
+            if (!stats.isFile()) {
+              throw new Error(`Attachment path is not a file: ${att.filePath}`);
+            }
+
+            return stats.size;
+          }),
+        );
+        const totalSize = attachmentSizes.reduce((sum, size) => sum + size, 0);
+        assertWithinAttachmentSizeLimit(totalSize);
+
+        // Read each file from disk
+        const resolvedAttachments = await Promise.all(
+          attachments.map(async (att) => {
+            let content: Buffer;
+            try {
+              content = await fs.readFile(att.filePath);
+            } catch (readError) {
+              throw new Error(
+                `Could not read attachment file ${att.filePath}: ${readError instanceof Error ? readError.message : String(readError)}`,
+              );
+            }
+            return {
+              // `||` (not `??`) so empty strings also fall back to defaults —
+              // an empty filename or MIME type is invalid in MIME headers.
+              filename: att.filename || path.basename(att.filePath),
+              content,
+              contentType:
+                att.mimeType || getMimeTypeFromExtension(att.filePath),
+            };
+          }),
+        );
+
+        // The stat-based check above is a pre-flight guard so oversized files
+        // are rejected before being read into memory, but a file can change
+        // between stat and read (TOCTOU). Re-check against the bytes actually
+        // read so the size cap is authoritative.
+        assertWithinAttachmentSizeLimit(
+          resolvedAttachments.reduce((sum, att) => sum + att.content.length, 0),
+        );
+
+        mimeMessage = MimeHelper.createMimeMessageWithAttachments({
+          to: Array.isArray(to) ? to.join(', ') : to,
+          subject,
+          body,
+          cc: cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : undefined,
+          bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
+          replyTo,
+          inReplyTo,
+          references,
+          isHtml,
+          attachments: resolvedAttachments,
+        });
+      } else {
+        mimeMessage = MimeHelper.createMimeMessage({
+          to: Array.isArray(to) ? to.join(', ') : to,
+          subject,
+          body,
+          cc: cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : undefined,
+          bcc: bcc ? (Array.isArray(bcc) ? bcc.join(', ') : bcc) : undefined,
+          replyTo,
+          isHtml,
+          inReplyTo,
+          references,
+        });
+      }
 
       const response = await gmail.users.drafts.create({
         userId: 'me',

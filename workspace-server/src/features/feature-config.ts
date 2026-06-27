@@ -203,6 +203,7 @@ export const FEATURE_GROUPS: readonly FeatureGroup[] = [
       'slides.getMetadata',
       'slides.getImages',
       'slides.getSlideThumbnail',
+      'slides.getSpeakerNotes',
     ],
     defaultEnabled: true,
   },
@@ -210,7 +211,22 @@ export const FEATURE_GROUPS: readonly FeatureGroup[] = [
     service: 'slides',
     group: 'write',
     scopes: scopes('presentations'),
-    tools: [],
+    tools: [
+      'slides.create',
+      'slides.addSlide',
+      'slides.deleteSlide',
+      'slides.duplicateSlide',
+      'slides.reorderSlides',
+      'slides.updateSpeakerNotes',
+      'slides.replaceAllText',
+      'slides.insertText',
+      'slides.deleteText',
+      'slides.addShape',
+      'slides.addImage',
+      'slides.addTable',
+      'slides.updateTextStyle',
+      'slides.updateShapeProperties',
+    ],
     defaultEnabled: false,
   },
 
@@ -244,14 +260,34 @@ export const FEATURE_GROUPS: readonly FeatureGroup[] = [
     service: 'tasks',
     group: 'read',
     scopes: scopes('tasks.readonly'),
-    tools: [],
+    tools: ['tasks.listLists', 'tasks.list'],
     defaultEnabled: false,
   },
   {
     service: 'tasks',
     group: 'write',
     scopes: scopes('tasks'),
-    tools: [],
+    tools: ['tasks.create', 'tasks.update', 'tasks.complete', 'tasks.delete'],
     defaultEnabled: false,
   },
 ] as const satisfies readonly FeatureGroup[];
+
+/**
+ * Every scope that any default-enabled feature group could request.
+ *
+ * This is the registration list for the OAuth consent screen — broader than
+ * the runtime request set, because users can disable individual write groups
+ * via WORKSPACE_FEATURE_OVERRIDES, which causes the paired read group's
+ * `.readonly` scope to be requested. Both must already be registered, or
+ * unverified apps hit "This app is blocked."
+ *
+ * Returned sorted for stable diffs in `setup-gcp.sh`.
+ */
+export function getAllPossibleScopes(): string[] {
+  const set = new Set<string>();
+  for (const fg of FEATURE_GROUPS) {
+    if (!fg.defaultEnabled) continue;
+    for (const scope of fg.scopes) set.add(scope);
+  }
+  return [...set].sort();
+}

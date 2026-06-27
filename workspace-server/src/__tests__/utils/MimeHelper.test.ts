@@ -140,6 +140,28 @@ describe('MimeHelper', () => {
       expect(decoded).toContain(`References: ${messageId}`);
     });
 
+    it('should sanitize In-Reply-To and References headers in simple messages', () => {
+      const encoded = MimeHelper.createMimeMessage({
+        to: 'recipient@example.com',
+        subject: 'Re: Test',
+        body: 'Body',
+        inReplyTo: '<orig@example.com>\r\nX-Injected: true',
+        references: '<a@example.com>\r\nX-Also-Injected: true',
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      // CR/LF stripped, so injected text cannot start a new header line
+      expect(decoded).not.toContain('\r\nX-Injected:');
+      expect(decoded).not.toContain('\r\nX-Also-Injected:');
+      expect(decoded).toContain(
+        'In-Reply-To: <orig@example.com>X-Injected: true',
+      );
+      expect(decoded).toContain(
+        'References: <a@example.com>X-Also-Injected: true',
+      );
+    });
+
     it('should not include In-Reply-To or References headers when not provided', () => {
       const encoded = MimeHelper.createMimeMessage({
         to: 'recipient@example.com',
@@ -242,6 +264,94 @@ describe('MimeHelper', () => {
       const decoded = MimeHelper.decodeBase64Url(encoded);
 
       expect(decoded).toContain('Content-Type: application/octet-stream');
+    });
+
+    it('should sanitize attachment filenames to prevent MIME header injection', () => {
+      const attachments = [
+        {
+          filename: 'evil"\r\nX-Injected: true\r\n.pdf',
+          content: Buffer.from('content'),
+          contentType: 'application/pdf\r\nX-Also-Injected: true',
+        },
+      ];
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'Injection Attempt',
+        body: 'Message',
+        attachments,
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      // CR/LF stripped, so injected text can never start a new header line
+      expect(decoded).not.toContain('\r\nX-Injected:');
+      expect(decoded).not.toContain('\r\nX-Also-Injected:');
+      // Quotes escaped, so the filename parameter cannot be terminated early
+      expect(decoded).toContain(
+        'Content-Disposition: attachment; filename="evil\\"X-Injected: true.pdf"',
+      );
+      expect(decoded).toContain(
+        'Content-Type: application/pdfX-Also-Injected: true',
+      );
+    });
+
+    it('should escape backslashes before quotes in attachment filenames', () => {
+      const attachments = [
+        {
+          // Raw filename: dir\file"name.txt
+          filename: 'dir\\file"name.txt',
+          content: Buffer.from('content'),
+          contentType: 'text/plain',
+        },
+      ];
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'Backslash Test',
+        body: 'Message',
+        attachments,
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      // Backslashes must be doubled BEFORE quotes are escaped, so a literal
+      // backslash can never pair with an escaped quote to re-terminate the
+      // filename parameter. Expected on the wire: dir\\file\"name.txt
+      expect(decoded).toContain(
+        'Content-Disposition: attachment; filename="dir\\\\file\\"name.txt"',
+      );
+    });
+
+    it('should sanitize In-Reply-To and References headers in multipart messages', () => {
+      const attachments = [
+        {
+          filename: 'f.txt',
+          content: Buffer.from('x'),
+          contentType: 'text/plain',
+        },
+      ];
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'Re: Test',
+        body: 'Body',
+        inReplyTo: '<orig@example.com>\r\nX-Injected: true',
+        references: '<a@example.com>\r\nX-Also-Injected: true',
+        attachments,
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      // CR/LF stripped, so injected text cannot start a new header line
+      expect(decoded).not.toContain('\r\nX-Injected:');
+      expect(decoded).not.toContain('\r\nX-Also-Injected:');
+      expect(decoded).toContain(
+        'In-Reply-To: <orig@example.com>X-Injected: true',
+      );
+      expect(decoded).toContain(
+        'References: <a@example.com>X-Also-Injected: true',
+      );
     });
 
     it('should properly format attachment content in 76-character lines', () => {
@@ -364,6 +474,74 @@ describe('MimeHelper', () => {
       expect(boundary1Match).toBeTruthy();
       expect(boundary2Match).toBeTruthy();
       expect(boundary1Match![1]).not.toBe(boundary2Match![1]);
+    });
+
+    it('should include In-Reply-To and References headers when provided with attachments', () => {
+      const messageId = '<original@mail.example.com>';
+      const refs = '<earlier@mail.example.com> <original@mail.example.com>';
+      const attachments = [
+        {
+          filename: 'test.txt',
+          content: Buffer.from('hello'),
+          contentType: 'text/plain',
+        },
+      ];
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'Re: Test',
+        body: 'Reply with attachment',
+        inReplyTo: messageId,
+        references: refs,
+        attachments,
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      expect(decoded).toContain(`In-Reply-To: ${messageId}`);
+      expect(decoded).toContain(`References: ${refs}`);
+      // Still multipart
+      expect(decoded).toContain('Content-Type: multipart/mixed; boundary=');
+    });
+
+    it('should include In-Reply-To and References headers when no attachments (fallback path)', () => {
+      const messageId = '<original@mail.example.com>';
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'Re: Test',
+        body: 'Reply without attachment',
+        inReplyTo: messageId,
+        references: messageId,
+        // no attachments — exercises the createMimeMessage fallback
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      expect(decoded).toContain(`In-Reply-To: ${messageId}`);
+      expect(decoded).toContain(`References: ${messageId}`);
+    });
+
+    it('should not include In-Reply-To or References in multipart message when not provided', () => {
+      const attachments = [
+        {
+          filename: 'file.pdf',
+          content: Buffer.from('data'),
+          contentType: 'application/pdf',
+        },
+      ];
+
+      const encoded = MimeHelper.createMimeMessageWithAttachments({
+        to: 'recipient@example.com',
+        subject: 'New Draft',
+        body: 'Body',
+        attachments,
+      });
+
+      const decoded = MimeHelper.decodeBase64Url(encoded);
+
+      expect(decoded).not.toContain('In-Reply-To:');
+      expect(decoded).not.toContain('References:');
     });
   });
 

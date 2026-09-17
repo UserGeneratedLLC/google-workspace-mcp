@@ -19,12 +19,17 @@ import {
 
 export class FileTokenStorage extends BaseTokenStorage {
   private readonly tokenFilePath: string;
+  private readonly hostnamesFilePath: string;
   private readonly encryptionKey: Buffer;
   private readonly masterKey: Buffer;
 
   private constructor(serviceName: string, masterKey: Buffer) {
     super(serviceName);
     this.tokenFilePath = ENCRYPTED_TOKEN_PATH;
+    this.hostnamesFilePath = path.join(
+      path.dirname(this.tokenFilePath),
+      '.gemini-cli-workspace-hostnames',
+    );
     this.masterKey = masterKey;
     this.encryptionKey = this.deriveEncryptionKey();
   }
@@ -89,15 +94,65 @@ export class FileTokenStorage extends BaseTokenStorage {
   }
 
   /**
+   * Best-effort read of the append-only hostname sidecar (one hostname per
+   * line). Never throws: a missing or unreadable sidecar just yields no
+   * extra candidates.
+   */
+  private async readHostnameSidecar(): Promise<string[]> {
+    try {
+      const data = await fs.readFile(this.hostnamesFilePath, 'utf-8');
+      return data
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Appends os.hostname() to the sidecar if it isn't already recorded.
+   * Some long-running old-binary processes (e.g. a Cursor MCP server
+   * started before this fix, and never restarted) keep saving token files
+   * under whichever hostname they had when they started -- a hostname that
+   * may be neither the *current* os.hostname() nor a scutil name (e.g. this
+   * machine flips between an mDNS `.local` name and a Tailscale MagicDNS
+   * name; other hostnames a stale process observed are not derivable from
+   * scutil at all). Recording every hostname this process has ever seen
+   * gives loadTokens() a durable list of legacy salts to fall back to. This
+   * is best-effort bookkeeping and must never break token I/O.
+   */
+  private async recordCurrentHostname(): Promise<void> {
+    try {
+      const hostname = os.hostname();
+      if (!hostname) {
+        return;
+      }
+      const known = await this.readHostnameSidecar();
+      if (known.includes(hostname)) {
+        return;
+      }
+      await this.ensureDirectoryExists();
+      await fs.appendFile(this.hostnamesFilePath, `${hostname}\n`, {
+        mode: 0o600,
+      });
+    } catch {
+      // Best effort only.
+    }
+  }
+
+  /**
    * Legacy hostname-salted keys to try, in order, when the stable key fails
    * to decrypt an existing token file. Candidate hostnames:
    *   1. os.hostname() -- the pre-fix salt basis.
    *   2. darwin only: `scutil --get LocalHostName` + '.local'
    *   3. darwin only: `scutil --get ComputerName`
    *   4. darwin only: the bare `scutil --get LocalHostName` value
+   *   5. every hostname recorded in the sidecar (see recordCurrentHostname)
+   *      that isn't already covered above.
    * scutil calls tolerate failure (see tryScutil) so this never throws.
    */
-  private getLegacyKeyCandidates(): Buffer[] {
+  private async getLegacyKeyCandidates(): Promise<Buffer[]> {
     const username = os.userInfo().username;
     const hostCandidates: string[] = [os.hostname()];
 
@@ -114,6 +169,9 @@ export class FileTokenStorage extends BaseTokenStorage {
         hostCandidates.push(localHostName);
       }
     }
+
+    const sidecarHosts = await this.readHostnameSidecar();
+    hostCandidates.push(...sidecarHosts);
 
     const seen = new Set<string>();
     const uniqueHosts = hostCandidates.filter((host) => {
@@ -193,6 +251,8 @@ export class FileTokenStorage extends BaseTokenStorage {
   }
 
   private async loadTokens(): Promise<Map<string, OAuthCredentials>> {
+    await this.recordCurrentHostname();
+
     let data: string;
     try {
       data = await fs.readFile(this.tokenFilePath, 'utf-8');
@@ -221,7 +281,7 @@ export class FileTokenStorage extends BaseTokenStorage {
     // legacy candidates in order; the first one that decrypts wins and the
     // file is immediately re-saved under the stable key so this only ever
     // happens once per token file.
-    for (const legacyKey of this.getLegacyKeyCandidates()) {
+    for (const legacyKey of await this.getLegacyKeyCandidates()) {
       try {
         const decrypted = this.decryptWithKey(data, legacyKey);
         const tokens = JSON.parse(decrypted) as Record<
@@ -247,6 +307,7 @@ export class FileTokenStorage extends BaseTokenStorage {
   private async saveTokens(
     tokens: Map<string, OAuthCredentials>,
   ): Promise<void> {
+    await this.recordCurrentHostname();
     await this.ensureDirectoryExists();
 
     const data = Object.fromEntries(tokens);

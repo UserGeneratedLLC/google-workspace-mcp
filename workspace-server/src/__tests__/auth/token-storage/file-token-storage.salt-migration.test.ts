@@ -26,6 +26,7 @@ import {
 } from '@jest/globals';
 import * as crypto from 'node:crypto';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { FileTokenStorage } from '../../../auth/token-storage/file-token-storage';
 import type { OAuthCredentials } from '../../../auth/token-storage/types';
@@ -35,10 +36,16 @@ import {
 } from '../../../utils/paths';
 import { logToFile } from '../../../utils/logger';
 
+const HOSTNAMES_SIDECAR_PATH = path.join(
+  path.dirname(ENCRYPTED_TOKEN_PATH),
+  '.gemini-cli-workspace-hostnames',
+);
+
 jest.mock('node:fs', () => ({
   promises: {
     readFile: jest.fn(),
     writeFile: jest.fn(),
+    appendFile: jest.fn(),
     rename: jest.fn(),
     unlink: jest.fn(),
     mkdir: jest.fn(),
@@ -84,6 +91,7 @@ describe('FileTokenStorage - stable salt migration', () => {
   const mockFs = fs as unknown as {
     readFile: ReturnType<typeof jest.fn>;
     writeFile: ReturnType<typeof jest.fn>;
+    appendFile: ReturnType<typeof jest.fn>;
     rename: ReturnType<typeof jest.fn>;
     unlink: ReturnType<typeof jest.fn>;
     mkdir: ReturnType<typeof jest.fn>;
@@ -93,7 +101,11 @@ describe('FileTokenStorage - stable salt migration', () => {
     jest.clearAllMocks();
   });
 
-  function mockDisk(masterKey: Buffer, tokenFileContents?: string) {
+  function mockDisk(
+    masterKey: Buffer,
+    tokenFileContents?: string,
+    sidecarHostnames?: string[],
+  ) {
     mockFs.readFile.mockImplementation(async (p: unknown) => {
       if (p === ENCRYPTION_MASTER_KEY_PATH) {
         return masterKey;
@@ -101,12 +113,16 @@ describe('FileTokenStorage - stable salt migration', () => {
       if (p === ENCRYPTED_TOKEN_PATH && tokenFileContents !== undefined) {
         return tokenFileContents;
       }
+      if (p === HOSTNAMES_SIDECAR_PATH && sidecarHostnames !== undefined) {
+        return `${sidecarHostnames.join('\n')}\n`;
+      }
       const err: NodeJS.ErrnoException = new Error('not found');
       err.code = 'ENOENT';
       throw err;
     });
     mockFs.mkdir.mockResolvedValue(undefined);
     mockFs.writeFile.mockResolvedValue(undefined);
+    mockFs.appendFile.mockResolvedValue(undefined);
     mockFs.rename.mockResolvedValue(undefined);
   }
 
@@ -207,5 +223,60 @@ describe('FileTokenStorage - stable salt migration', () => {
     expect(logToFile).toHaveBeenCalledWith('Token file corrupted');
     // Corruption must never trigger a "recovery" write.
     expect(mockFs.writeFile).not.toHaveBeenCalled();
+  });
+
+  it('(4) migrates a file encrypted under a hostname that only appears in the hostnames sidecar', async () => {
+    const masterKey = crypto.randomBytes(32);
+    const username = os.userInfo().username;
+    // A hostname a long-running old-binary process started under -- it is
+    // neither the current os.hostname() nor a scutil name (scutil is
+    // mocked to throw in this suite), so the *only* way loadTokens() can
+    // find this key is by consulting the hostnames sidecar.
+    const staleHostname = 'old-binary-host.example';
+    const legacySalt = `${staleHostname}-${username}-gemini-cli-workspace`;
+    const legacyKey = crypto.scryptSync(masterKey, legacySalt, 32);
+
+    const credentials: OAuthCredentials = {
+      serverName: 'sidecar-only-server',
+      token: { accessToken: 'sidecar-tok', tokenType: 'Bearer' },
+      updatedAt: Date.now() - 9000,
+    };
+    const legacyEncrypted = encryptWithKey(
+      JSON.stringify({ 'sidecar-only-server': credentials }),
+      legacyKey,
+    );
+
+    mockDisk(masterKey, legacyEncrypted, [staleHostname]);
+    const storage = await FileTokenStorage.create('test-storage');
+    const result = await storage.getCredentials('sidecar-only-server');
+
+    expect(result).toEqual(credentials);
+    expect(logToFile).toHaveBeenCalledWith(
+      'Token file migrated from legacy hostname salt',
+    );
+
+    // Re-saved atomically under the stable key, same as the other
+    // migration paths.
+    const tokenWriteCall = (
+      mockFs.writeFile.mock.calls as [string, string, unknown][]
+    ).find(([p]) => p.startsWith(`${ENCRYPTED_TOKEN_PATH}.tmp-`));
+    expect(tokenWriteCall).toBeDefined();
+    const [tmpPath, reEncrypted] = tokenWriteCall!;
+    expect(mockFs.rename).toHaveBeenCalledWith(tmpPath, ENCRYPTED_TOKEN_PATH);
+
+    const stableSalt = `${username}-gemini-cli-workspace-v2`;
+    const stableKey = crypto.scryptSync(masterKey, stableSalt, 32);
+    const decrypted = decryptWithKey(reEncrypted, stableKey);
+    expect(JSON.parse(decrypted)).toEqual({
+      'sidecar-only-server': credentials,
+    });
+
+    // The current machine's real hostname must be recorded into the
+    // sidecar too (append-only, so future flips back to it still work).
+    expect(mockFs.appendFile).toHaveBeenCalledWith(
+      HOSTNAMES_SIDECAR_PATH,
+      expect.stringContaining(os.hostname()),
+      { mode: 0o600 },
+    );
   });
 });

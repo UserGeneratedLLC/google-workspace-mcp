@@ -26,6 +26,7 @@ jest.mock('node:fs', () => ({
   promises: {
     readFile: jest.fn(),
     writeFile: jest.fn(),
+    appendFile: jest.fn(),
     rename: jest.fn(),
     unlink: jest.fn(),
     mkdir: jest.fn(),

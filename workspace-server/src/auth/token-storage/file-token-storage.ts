@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { BaseTokenStorage } from './base-token-storage';
 import type { OAuthCredentials } from './types';
 import { logToFile } from '../../utils/logger';
@@ -48,16 +49,93 @@ export class FileTokenStorage extends BaseTokenStorage {
     }
   }
 
+  /**
+   * Derives the current (stable) encryption key.
+   *
+   * The salt intentionally does NOT include os.hostname(): on machines whose
+   * hostname changes at runtime (e.g. a Mac that reports a different name
+   * depending on whether Tailscale's MagicDNS name or the LAN name wins the
+   * race, or a DHCP lease rename), a hostname-salted key made a token file
+   * written under one hostname undecryptable under another, surfacing as a
+   * spurious "Token file corrupted" and forcing re-consent. See
+   * `getLegacyKeyCandidates()` for the migration path off the old salt.
+   */
   private deriveEncryptionKey(): Buffer {
-    const salt = `${os.hostname()}-${
-      os.userInfo().username
-    }-gemini-cli-workspace`;
+    const salt = `${os.userInfo().username}-gemini-cli-workspace-v2`;
+    return this.deriveKeyFromSalt(salt);
+  }
+
+  private deriveKeyFromSalt(salt: string): Buffer {
     return crypto.scryptSync(this.masterKey, salt, 32);
   }
 
+  /**
+   * Best-effort read of a `scutil --get <key>` value. Returns null (never
+   * throws) when scutil is unavailable (non-darwin) or the call fails for
+   * any reason -- legacy-salt probing must never be able to crash the
+   * server.
+   */
+  private tryScutil(key: string): string | null {
+    try {
+      const result = execFileSync('scutil', ['--get', key], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const trimmed = result.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Legacy hostname-salted keys to try, in order, when the stable key fails
+   * to decrypt an existing token file. Candidate hostnames:
+   *   1. os.hostname() -- the pre-fix salt basis.
+   *   2. darwin only: `scutil --get LocalHostName` + '.local'
+   *   3. darwin only: `scutil --get ComputerName`
+   *   4. darwin only: the bare `scutil --get LocalHostName` value
+   * scutil calls tolerate failure (see tryScutil) so this never throws.
+   */
+  private getLegacyKeyCandidates(): Buffer[] {
+    const username = os.userInfo().username;
+    const hostCandidates: string[] = [os.hostname()];
+
+    if (process.platform === 'darwin') {
+      const localHostName = this.tryScutil('LocalHostName');
+      if (localHostName) {
+        hostCandidates.push(`${localHostName}.local`);
+      }
+      const computerName = this.tryScutil('ComputerName');
+      if (computerName) {
+        hostCandidates.push(computerName);
+      }
+      if (localHostName) {
+        hostCandidates.push(localHostName);
+      }
+    }
+
+    const seen = new Set<string>();
+    const uniqueHosts = hostCandidates.filter((host) => {
+      if (!host || seen.has(host)) {
+        return false;
+      }
+      seen.add(host);
+      return true;
+    });
+
+    return uniqueHosts.map((host) =>
+      this.deriveKeyFromSalt(`${host}-${username}-gemini-cli-workspace`),
+    );
+  }
+
   private encrypt(text: string): string {
+    return this.encryptWithKey(text, this.encryptionKey);
+  }
+
+  private encryptWithKey(text: string, key: Buffer): string {
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
 
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -68,6 +146,10 @@ export class FileTokenStorage extends BaseTokenStorage {
   }
 
   private decrypt(encryptedData: string): string {
+    return this.decryptWithKey(encryptedData, this.encryptionKey);
+  }
+
+  private decryptWithKey(encryptedData: string, key: Buffer): string {
     const parts = encryptedData.split(':');
     if (parts.length !== 3) {
       throw new Error('Invalid encrypted data format');
@@ -77,11 +159,7 @@ export class FileTokenStorage extends BaseTokenStorage {
     const authTag = Buffer.from(parts[1], 'hex');
     const encrypted = parts[2];
 
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      this.encryptionKey,
-      iv,
-    );
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
 
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
@@ -90,34 +168,80 @@ export class FileTokenStorage extends BaseTokenStorage {
     return decrypted;
   }
 
+  /**
+   * True when `error` looks like "wrong key" rather than a real fault: a
+   * malformed envelope, a GCM auth-tag mismatch, or JSON.parse choking on
+   * garbage plaintext that happened to pass GCM's own check.
+   */
+  private isDecryptError(error: unknown): boolean {
+    if (error instanceof SyntaxError) {
+      return true;
+    }
+    const message = (error as { message?: string })?.message ?? '';
+    const lower = message.toLowerCase();
+    return (
+      message.includes('Invalid encrypted data format') ||
+      message.includes('Unsupported state or unable to authenticate data') ||
+      lower.includes('bad decrypt') ||
+      lower.includes('unable to authenticate')
+    );
+  }
+
   private async ensureDirectoryExists(): Promise<void> {
     const dir = path.dirname(this.tokenFilePath);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   }
 
   private async loadTokens(): Promise<Map<string, OAuthCredentials>> {
+    let data: string;
     try {
-      const data = await fs.readFile(this.tokenFilePath, 'utf-8');
-      const decrypted = this.decrypt(data);
-      const tokens = JSON.parse(decrypted) as Record<string, OAuthCredentials>;
-      return new Map(Object.entries(tokens));
+      data = await fs.readFile(this.tokenFilePath, 'utf-8');
     } catch (error: unknown) {
-      const err = error as NodeJS.ErrnoException & { message?: string };
+      const err = error as NodeJS.ErrnoException;
       if (err.code === 'ENOENT') {
         logToFile('Token file does not exist');
         return new Map<string, OAuthCredentials>();
       }
-      if (
-        err.message?.includes('Invalid encrypted data format') ||
-        err.message?.includes(
-          'Unsupported state or unable to authenticate data',
-        )
-      ) {
-        logToFile('Token file corrupted');
-        return new Map<string, OAuthCredentials>();
-      }
       throw error;
     }
+
+    // Try the current, stable (hostname-independent) key first.
+    try {
+      const decrypted = this.decrypt(data);
+      const tokens = JSON.parse(decrypted) as Record<string, OAuthCredentials>;
+      return new Map(Object.entries(tokens));
+    } catch (error: unknown) {
+      if (!this.isDecryptError(error)) {
+        throw error;
+      }
+    }
+
+    // The stable key failed to authenticate the file -- it may have been
+    // written before this fix, under a hostname-salted key. Probe the
+    // legacy candidates in order; the first one that decrypts wins and the
+    // file is immediately re-saved under the stable key so this only ever
+    // happens once per token file.
+    for (const legacyKey of this.getLegacyKeyCandidates()) {
+      try {
+        const decrypted = this.decryptWithKey(data, legacyKey);
+        const tokens = JSON.parse(decrypted) as Record<
+          string,
+          OAuthCredentials
+        >;
+        const migrated = new Map(Object.entries(tokens));
+        logToFile('Token file migrated from legacy hostname salt');
+        await this.saveTokens(migrated);
+        return migrated;
+      } catch (error: unknown) {
+        if (!this.isDecryptError(error)) {
+          throw error;
+        }
+        // Not this candidate -- try the next one.
+      }
+    }
+
+    logToFile('Token file corrupted');
+    return new Map<string, OAuthCredentials>();
   }
 
   private async saveTokens(
@@ -129,7 +253,14 @@ export class FileTokenStorage extends BaseTokenStorage {
     const json = JSON.stringify(data, null, 2);
     const encrypted = this.encrypt(json);
 
-    await fs.writeFile(this.tokenFilePath, encrypted, { mode: 0o600 });
+    // Write to a unique temp file and rename into place atomically so a
+    // concurrent writer (or a crash mid-write) can never leave a
+    // half-written, unparseable token file on disk.
+    const tmpPath = `${this.tokenFilePath}.tmp-${process.pid}-${crypto
+      .randomBytes(6)
+      .toString('hex')}`;
+    await fs.writeFile(tmpPath, encrypted, { mode: 0o600 });
+    await fs.rename(tmpPath, this.tokenFilePath);
   }
 
   async getCredentials(serverName: string): Promise<OAuthCredentials | null> {

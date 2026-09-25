@@ -83,6 +83,103 @@ export class AuthManager {
     );
   }
 
+  private missingScopes(credentials: Auth.Credentials): string[] {
+    const savedScopes = new Set(credentials.scope?.split(' ') ?? []);
+    return this.scopes.filter((scope) => !savedScopes.has(scope));
+  }
+
+  /**
+   * Adopt the stored credentials when they are already usable as-is: another
+   * process sharing this token file may have refreshed (or signed in again)
+   * since this one last looked, and its fresh access token saves a refresh
+   * round trip — and never races it.
+   */
+  private async adoptStoredIfUsable(
+    client: Auth.OAuth2Client,
+  ): Promise<boolean> {
+    const stored = await OAuthCredentialStorage.loadCredentials().catch(
+      (error) => {
+        logToFile(`Could not read stored credentials: ${error}`);
+        return null;
+      },
+    );
+    if (
+      !stored?.refresh_token ||
+      this.missingScopes(stored).length > 0 ||
+      this.isTokenExpiringSoon(stored)
+    ) {
+      return false;
+    }
+    client.setCredentials(stored);
+    logToFile('Adopted fresher stored credentials; no refresh needed');
+    return true;
+  }
+
+  /**
+   * Stored credentials carrying a grant other than `staleRefreshToken`, with
+   * every required scope: what a sign-in in another process leaves behind.
+   */
+  private async loadNewerGrant(
+    staleRefreshToken: string | null | undefined,
+  ): Promise<Auth.Credentials | null> {
+    const stored = await OAuthCredentialStorage.loadCredentials().catch(
+      () => null,
+    );
+    if (
+      !stored?.refresh_token ||
+      stored.refresh_token === staleRefreshToken ||
+      this.missingScopes(stored).length > 0
+    ) {
+      return null;
+    }
+    return stored;
+  }
+
+  /**
+   * Put `credentials` on `client` and make sure its access token is live.
+   * False when that grant is itself revoked; a transient failure throws.
+   */
+  private async adoptGrant(
+    client: Auth.OAuth2Client,
+    credentials: Auth.Credentials,
+  ): Promise<boolean> {
+    client.setCredentials(credentials);
+    if (!this.isTokenExpiringSoon(credentials)) return true;
+    try {
+      await this.refreshClient(client);
+      return true;
+    } catch (error) {
+      if (error instanceof RefreshGrantRevokedError) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Bring an expiring client back to a live access token without a sign-in
+   * whenever one is avoidable: adopt what storage already holds, else
+   * refresh, else — the grant is revoked — adopt a newer grant another
+   * process stored. False only when no usable grant is left; a transient
+   * refresh failure throws and leaves client and storage untouched.
+   */
+  private async ensureFresh(client: Auth.OAuth2Client): Promise<boolean> {
+    if (await this.adoptStoredIfUsable(client)) return true;
+
+    const heldRefreshToken = client.credentials.refresh_token;
+    try {
+      await this.refreshClient(client);
+      logToFile('Token refreshed successfully');
+      return true;
+    } catch (error) {
+      logToFile(`Failed to refresh token: ${error}`);
+      if (!(error instanceof RefreshGrantRevokedError)) throw error;
+    }
+
+    const newer = await this.loadNewerGrant(heldRefreshToken);
+    if (!newer) return false;
+    logToFile('Held grant is revoked; adopting the newer stored grant');
+    return this.adoptGrant(client, newer);
+  }
+
   private async loadCachedCredentials(
     client: Auth.OAuth2Client,
   ): Promise<boolean> {
@@ -90,13 +187,10 @@ export class AuthManager {
 
     if (credentials) {
       // Check if saved token has required scopes
-      const savedScopes = new Set(credentials.scope?.split(' ') ?? []);
-      logToFile(`Cached token has scopes: ${[...savedScopes].join(', ')}`);
+      logToFile(`Cached token has scopes: ${credentials.scope ?? ''}`);
       logToFile(`Required scopes: ${this.scopes.join(', ')}`);
 
-      const missingScopes = this.scopes.filter(
-        (scope) => !savedScopes.has(scope),
-      );
+      const missingScopes = this.missingScopes(credentials);
 
       if (missingScopes.length > 0) {
         logToFile(
@@ -132,29 +226,39 @@ export class AuthManager {
 
       const isExpired = this.isTokenExpiringSoon(this.client.credentials);
       logToFile(`Token expired: ${isExpired}`);
+      if (!isExpired) return this.client;
 
-      // Proactively refresh if expired
-      if (isExpired) {
-        logToFile('Token is expired, refreshing proactively...');
-        try {
-          await this.refreshToken();
-          logToFile('Token refreshed successfully');
-        } catch (error) {
-          logToFile(`Failed to refresh token: ${error}`);
-          // A transient failure keeps the client and the stored grant; the
-          // next call retries. Only a revoked grant falls through to sign-in,
-          // and even then the stored credentials are left for it to replace.
-          if (!(error instanceof RefreshGrantRevokedError)) throw error;
-          this.client = null;
-        }
-      }
-
-      // Return the client (either still valid or just refreshed)
-      if (this.client) {
-        return this.client;
-      }
+      // Proactively refresh. A transient failure throws and keeps the client
+      // and the stored grant (the next call retries); only a revoked grant
+      // with nothing newer stored falls through to a new sign-in, and even
+      // then the stored credentials are left for that sign-in to replace.
+      logToFile('Token is expired, refreshing proactively...');
+      const held = this.client;
+      if (await this.ensureFresh(held)) return held;
+      this.client = null;
+      return this.interactiveLogin(this.createOAuthClient());
     }
 
+    const oAuth2Client = this.createOAuthClient();
+
+    logToFile('No valid cached client, checking for saved credentials...');
+    if (await this.loadCachedCredentials(oAuth2Client)) {
+      logToFile('Loaded saved credentials, caching and returning client');
+      this.client = oAuth2Client;
+
+      const isExpired = this.isTokenExpiringSoon(oAuth2Client.credentials);
+      logToFile(`Token expired: ${isExpired}`);
+      if (!isExpired) return oAuth2Client;
+
+      logToFile('Loaded token is expired, refreshing proactively...');
+      if (await this.ensureFresh(oAuth2Client)) return oAuth2Client;
+      this.client = null;
+    }
+
+    return this.interactiveLogin(oAuth2Client);
+  }
+
+  private createOAuthClient(): Auth.OAuth2Client {
     // Note: No clientSecret is provided here. The secret is only known by the cloud function.
     const options: Auth.OAuth2ClientOptions = {
       clientId: CLIENT_ID,
@@ -181,33 +285,12 @@ export class AuthManager {
       }
     });
 
-    logToFile('No valid cached client, checking for saved credentials...');
-    if (await this.loadCachedCredentials(oAuth2Client)) {
-      logToFile('Loaded saved credentials, caching and returning client');
-      this.client = oAuth2Client;
+    return oAuth2Client;
+  }
 
-      // Check if the loaded token is expired and refresh proactively
-      const isExpired = this.isTokenExpiringSoon(this.client.credentials);
-      logToFile(`Token expired: ${isExpired}`);
-
-      if (isExpired) {
-        logToFile('Loaded token is expired, refreshing proactively...');
-        try {
-          await this.refreshToken();
-          logToFile('Token refreshed successfully after loading from storage');
-        } catch (error) {
-          logToFile(`Failed to refresh loaded token: ${error}`);
-          if (!(error instanceof RefreshGrantRevokedError)) throw error;
-          this.client = null;
-        }
-      }
-
-      // Return the client if refresh succeeded or token was still valid
-      if (this.client) {
-        return this.client;
-      }
-    }
-
+  private async interactiveLogin(
+    oAuth2Client: Auth.OAuth2Client,
+  ): Promise<Auth.OAuth2Client> {
     // Fail fast in headless environments instead of hanging for 5 minutes
     if (!shouldLaunchBrowser()) {
       throw new Error(
@@ -258,8 +341,12 @@ export class AuthManager {
       logToFile('No client available to refresh, getting new client');
       this.client = await this.getAuthenticatedClient();
     }
+    await this.refreshClient(this.client);
+  }
+
+  private async refreshClient(client: Auth.OAuth2Client): Promise<void> {
     try {
-      const currentCredentials = { ...this.client.credentials };
+      const currentCredentials = { ...client.credentials };
 
       if (!currentCredentials.refresh_token) {
         throw new Error('No refresh token available');
@@ -276,7 +363,7 @@ export class AuthManager {
         refresh_token: currentCredentials.refresh_token, // Always preserve original
       };
 
-      this.client.setCredentials(mergedCredentials);
+      client.setCredentials(mergedCredentials);
       await OAuthCredentialStorage.saveCredentials(mergedCredentials);
       logToFile('Token refreshed and saved successfully via cloud function');
     } catch (error) {

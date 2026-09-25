@@ -6,11 +6,14 @@
 
 import { google, Auth } from 'googleapis';
 import crypto from 'node:crypto';
+import { promises as fs } from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
+import * as path from 'node:path';
 import * as url from 'node:url';
 import { logToFile } from '../utils/logger';
 import open from '../utils/open-wrapper';
+import { AUTH_LOCK_PATH } from '../utils/paths';
 import { shouldLaunchBrowser } from '../utils/secure-browser-launcher';
 import { OAuthCredentialStorage } from './token-storage/oauth-credential-storage';
 import { loadConfig } from '../utils/config';
@@ -20,18 +23,33 @@ const CLIENT_ID = config.clientId;
 const CLOUD_FUNCTION_URL = config.cloudFunctionUrl;
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
 
+const LOGIN_TIMEOUT_MESSAGE =
+  'User is not authenticated. Authentication timed out after 5 minutes. The user did not complete the login process in the browser. ' +
+  'Please ask the user to check their browser and try again.';
+
 /** Timing knobs, overridable so tests do not wait out real network backoff. */
 export interface AuthTiming {
   /** Per-attempt deadline for the cloud function refresh call. */
   refreshTimeoutMs: number;
   /** Waits between refresh attempts; one more attempt than entries. */
   refreshRetryDelaysMs: readonly number[];
+  /** How long a browser sign-in (or waiting on another process's) may take. */
+  loginTimeoutMs: number;
+  /** How often a process waiting on another's sign-in re-reads storage. */
+  loginPollIntervalMs: number;
+  /** Age past which a sign-in lock is abandoned even if its pid is alive. */
+  loginLockStaleMs: number;
 }
 
 const DEFAULT_TIMING: AuthTiming = {
   refreshTimeoutMs: 15_000,
   refreshRetryDelaysMs: [1_000, 4_000],
+  loginTimeoutMs: 5 * 60_000,
+  loginPollIntervalMs: 2_000,
+  loginLockStaleMs: 6 * 60_000,
 };
+
+type LoginLock = 'acquired' | 'held-elsewhere' | 'unavailable';
 
 /**
  * Google answered the refresh with `invalid_grant`: the stored refresh token
@@ -66,6 +84,8 @@ export class AuthManager {
   private scopes: string[];
   private onStatusUpdate: ((message: string) => void) | null = null;
   private timing: AuthTiming;
+  /** The one sign-in in flight in this process; concurrent callers share it. */
+  private pendingLogin: Promise<Auth.OAuth2Client> | null = null;
 
   constructor(scopes: string[], timing: Partial<AuthTiming> = {}) {
     this.scopes = scopes;
@@ -234,12 +254,14 @@ export class AuthManager {
       // then the stored credentials are left for that sign-in to replace.
       logToFile('Token is expired, refreshing proactively...');
       const held = this.client;
+      const heldRefreshToken = held.credentials.refresh_token;
       if (await this.ensureFresh(held)) return held;
       this.client = null;
-      return this.interactiveLogin(this.createOAuthClient());
+      return this.signIn(this.createOAuthClient(), heldRefreshToken);
     }
 
     const oAuth2Client = this.createOAuthClient();
+    let staleRefreshToken: string | null | undefined = null;
 
     logToFile('No valid cached client, checking for saved credentials...');
     if (await this.loadCachedCredentials(oAuth2Client)) {
@@ -251,11 +273,31 @@ export class AuthManager {
       if (!isExpired) return oAuth2Client;
 
       logToFile('Loaded token is expired, refreshing proactively...');
+      staleRefreshToken = oAuth2Client.credentials.refresh_token;
       if (await this.ensureFresh(oAuth2Client)) return oAuth2Client;
       this.client = null;
     }
 
-    return this.interactiveLogin(oAuth2Client);
+    return this.signIn(oAuth2Client, staleRefreshToken);
+  }
+
+  /**
+   * One sign-in per process at a time: a burst of tool calls that all find
+   * no usable grant await the same flow instead of each opening a tab.
+   */
+  private signIn(
+    oAuth2Client: Auth.OAuth2Client,
+    staleRefreshToken: string | null | undefined,
+  ): Promise<Auth.OAuth2Client> {
+    if (!this.pendingLogin) {
+      this.pendingLogin = this.interactiveLogin(
+        oAuth2Client,
+        staleRefreshToken,
+      ).finally(() => {
+        this.pendingLogin = null;
+      });
+    }
+    return this.pendingLogin;
   }
 
   private createOAuthClient(): Auth.OAuth2Client {
@@ -288,8 +330,14 @@ export class AuthManager {
     return oAuth2Client;
   }
 
+  /**
+   * A sign-in that at most one process sharing this data dir runs at a time:
+   * the holder of the sign-in lock opens the browser, every other process
+   * waits for the grant it stores and adopts that.
+   */
   private async interactiveLogin(
     oAuth2Client: Auth.OAuth2Client,
+    staleRefreshToken: string | null | undefined,
   ): Promise<Auth.OAuth2Client> {
     // Fail fast in headless environments instead of hanging for 5 minutes
     if (!shouldLaunchBrowser()) {
@@ -301,6 +349,28 @@ export class AuthManager {
       );
     }
 
+    const lock = await this.acquireLoginLock();
+    if (lock === 'held-elsewhere') {
+      return this.awaitOtherSignIn(oAuth2Client, staleRefreshToken);
+    }
+    try {
+      // A sign-in that finished in another process just before this one took
+      // the lock has already stored its grant.
+      const newer = await this.loadNewerGrant(staleRefreshToken);
+      if (newer && (await this.adoptGrant(oAuth2Client, newer))) {
+        logToFile('Adopted the grant another process just signed in with');
+        this.client = oAuth2Client;
+        return oAuth2Client;
+      }
+      return await this.browserSignIn(oAuth2Client);
+    } finally {
+      if (lock === 'acquired') await this.releaseLoginLock();
+    }
+  }
+
+  private async browserSignIn(
+    oAuth2Client: Auth.OAuth2Client,
+  ): Promise<Auth.OAuth2Client> {
     const webLogin = await this.authWithWeb(oAuth2Client);
     await open(webLogin.authUrl);
     const msg = 'Waiting for authentication... Check your browser.';
@@ -310,22 +380,124 @@ export class AuthManager {
     }
 
     // Add timeout to prevent infinite waiting when browser tab gets stuck
-    const authTimeout = 5 * 60 * 1000; // 5 minutes timeout
+    let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(
-          new Error(
-            'User is not authenticated. Authentication timed out after 5 minutes. The user did not complete the login process in the browser. ' +
-              'Please ask the user to check their browser and try again.',
-          ),
-        );
-      }, authTimeout);
+      timer = setTimeout(
+        () => reject(new Error(LOGIN_TIMEOUT_MESSAGE)),
+        this.timing.loginTimeoutMs,
+      );
     });
-    await Promise.race([webLogin.loginCompletePromise, timeoutPromise]);
+    try {
+      await Promise.race([webLogin.loginCompletePromise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
 
     await OAuthCredentialStorage.saveCredentials(oAuth2Client.credentials);
     this.client = oAuth2Client;
     return this.client;
+  }
+
+  /**
+   * Another process holds the sign-in lock: never open a second browser tab,
+   * poll storage for the grant it will store and adopt that one.
+   */
+  private async awaitOtherSignIn(
+    client: Auth.OAuth2Client,
+    staleRefreshToken: string | null | undefined,
+  ): Promise<Auth.OAuth2Client> {
+    const msg =
+      'Another process is already signing in to Google; waiting for it to finish.';
+    logToFile(msg);
+    if (this.onStatusUpdate) {
+      this.onStatusUpdate(msg);
+    }
+
+    let stale = staleRefreshToken;
+    const deadline = Date.now() + this.timing.loginTimeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(this.timing.loginPollIntervalMs);
+      const newer = await this.loadNewerGrant(stale);
+      if (!newer) continue;
+      if (await this.adoptGrant(client, newer)) {
+        logToFile('Adopted the grant another process signed in with');
+        this.client = client;
+        return client;
+      }
+      stale = newer.refresh_token;
+    }
+    throw new Error(LOGIN_TIMEOUT_MESSAGE);
+  }
+
+  /**
+   * Take the per-data-dir sign-in lock. The record is written to a private
+   * temp file and hard-linked into place, so a reader never sees a lock
+   * without its pid. A lock whose holder is dead, or older than
+   * `loginLockStaleMs`, is removed and acquisition retried once.
+   */
+  private async acquireLoginLock(): Promise<LoginLock> {
+    const tmpPath = `${AUTH_LOCK_PATH}.${process.pid}-${crypto
+      .randomBytes(4)
+      .toString('hex')}`;
+    try {
+      await fs.mkdir(path.dirname(AUTH_LOCK_PATH), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await fs.writeFile(
+        tmpPath,
+        JSON.stringify({ pid: process.pid, startedAt: Date.now() }),
+        { mode: 0o600 },
+      );
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await fs.link(tmpPath, AUTH_LOCK_PATH);
+          return 'acquired';
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        if (await this.loginLockIsLive()) return 'held-elsewhere';
+        logToFile('Removing a stale sign-in lock');
+        await fs.unlink(AUTH_LOCK_PATH).catch(() => undefined);
+      }
+      return 'held-elsewhere';
+    } catch (error) {
+      // Signing in without the lock beats not signing in at all.
+      logToFile(`Sign-in lock unavailable, continuing without it: ${error}`);
+      return 'unavailable';
+    } finally {
+      await fs.unlink(tmpPath).catch(() => undefined);
+    }
+  }
+
+  private async loginLockIsLive(): Promise<boolean> {
+    let holder: { pid?: unknown; startedAt?: unknown };
+    try {
+      holder = JSON.parse(await fs.readFile(AUTH_LOCK_PATH, 'utf-8'));
+    } catch {
+      return false;
+    }
+    const { pid, startedAt } = holder;
+    if (typeof pid !== 'number' || typeof startedAt !== 'number') return false;
+    // In-process sign-ins share `pendingLogin`, so a lock naming this pid is a
+    // leftover, never a live holder.
+    if (pid === process.pid) return false;
+    if (Date.now() - startedAt >= this.timing.loginLockStaleMs) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
+
+  private async releaseLoginLock(): Promise<void> {
+    try {
+      const { pid } = JSON.parse(await fs.readFile(AUTH_LOCK_PATH, 'utf-8'));
+      if (pid === process.pid) await fs.unlink(AUTH_LOCK_PATH);
+    } catch {
+      // Already gone.
+    }
   }
 
   public async clearAuth(): Promise<void> {

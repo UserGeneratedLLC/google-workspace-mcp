@@ -33,3 +33,8 @@ export const ENCRYPTION_MASTER_KEY_PATH = path.join(
   PROJECT_ROOT,
   '.gemini-cli-workspace-master-key',
 );
+// Held by the one process running a browser sign-in for this data dir.
+export const AUTH_LOCK_PATH = path.join(
+  PROJECT_ROOT,
+  '.gemini-cli-workspace-auth.lock',
+);

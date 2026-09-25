@@ -20,6 +20,37 @@ const CLIENT_ID = config.clientId;
 const CLOUD_FUNCTION_URL = config.cloudFunctionUrl;
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
 
+/** Timing knobs, overridable so tests do not wait out real network backoff. */
+export interface AuthTiming {
+  /** Per-attempt deadline for the cloud function refresh call. */
+  refreshTimeoutMs: number;
+  /** Waits between refresh attempts; one more attempt than entries. */
+  refreshRetryDelaysMs: readonly number[];
+}
+
+const DEFAULT_TIMING: AuthTiming = {
+  refreshTimeoutMs: 15_000,
+  refreshRetryDelaysMs: [1_000, 4_000],
+};
+
+/**
+ * Google answered the refresh with `invalid_grant`: the stored refresh token
+ * is revoked or expired and only a new sign-in (or a newer grant another
+ * process already stored) can replace it. Every other refresh failure is
+ * transient and leaves the stored credentials alone.
+ */
+export class RefreshGrantRevokedError extends Error {
+  constructor(
+    message = 'Stored Google grant is no longer valid (invalid_grant); a new sign-in is required.',
+  ) {
+    super(message);
+    this.name = 'RefreshGrantRevokedError';
+  }
+}
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /**
  * An Authentication URL for updating the credentials of a Oauth2Client
  * as well as a promise that will resolve when the credentials have
@@ -34,9 +65,11 @@ export class AuthManager {
   private client: Auth.OAuth2Client | null = null;
   private scopes: string[];
   private onStatusUpdate: ((message: string) => void) | null = null;
+  private timing: AuthTiming;
 
-  constructor(scopes: string[]) {
+  constructor(scopes: string[], timing: Partial<AuthTiming> = {}) {
     this.scopes = scopes;
+    this.timing = { ...DEFAULT_TIMING, ...timing };
   }
 
   public setOnStatusUpdate(callback: (message: string) => void) {
@@ -108,9 +141,11 @@ export class AuthManager {
           logToFile('Token refreshed successfully');
         } catch (error) {
           logToFile(`Failed to refresh token: ${error}`);
-          // Clear the client and fall through to re-authenticate
+          // A transient failure keeps the client and the stored grant; the
+          // next call retries. Only a revoked grant falls through to sign-in,
+          // and even then the stored credentials are left for it to replace.
+          if (!(error instanceof RefreshGrantRevokedError)) throw error;
           this.client = null;
-          await OAuthCredentialStorage.clearCredentials();
         }
       }
 
@@ -162,9 +197,8 @@ export class AuthManager {
           logToFile('Token refreshed successfully after loading from storage');
         } catch (error) {
           logToFile(`Failed to refresh loaded token: ${error}`);
-          // Clear the client and fall through to re-authenticate
+          if (!(error instanceof RefreshGrantRevokedError)) throw error;
           this.client = null;
-          await OAuthCredentialStorage.clearCredentials();
         }
       }
 
@@ -231,28 +265,9 @@ export class AuthManager {
         throw new Error('No refresh token available');
       }
 
-      logToFile('Calling cloud function to refresh token...');
-
-      // Call the cloud function refresh endpoint
-      // The cloud function has the client secret needed for token refresh
-      const response = await fetch(`${CLOUD_FUNCTION_URL}/refreshToken`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          refresh_token: currentCredentials.refresh_token,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Token refresh failed: ${response.status} ${errorText}`,
-        );
-      }
-
-      const newTokens = await response.json();
+      const newTokens = await this.requestRefreshedTokens(
+        currentCredentials.refresh_token,
+      );
 
       // Merge new tokens with existing credentials, preserving refresh_token
       // Note: Google does NOT return a new refresh_token on refresh
@@ -268,6 +283,71 @@ export class AuthManager {
       logToFile(`Error during token refresh: ${error}`);
       throw error;
     }
+  }
+
+  /**
+   * One refresh round trip through the cloud function (it holds the client
+   * secret), retried on anything that is not Google rejecting the grant.
+   * Throws `RefreshGrantRevokedError` only on a 400/401 `invalid_grant`;
+   * every other failure ends in an error whose text names no auth fault, so
+   * a caller never mistakes a network blip for a dead grant.
+   */
+  private async requestRefreshedTokens(
+    refreshToken: string,
+  ): Promise<Auth.Credentials> {
+    const delays = this.timing.refreshRetryDelaysMs;
+    let lastFailure = 'unknown error';
+
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      if (attempt > 0) await sleep(delays[attempt - 1]);
+      logToFile(
+        `Calling cloud function to refresh token (attempt ${attempt + 1})...`,
+      );
+
+      let response: Response;
+      try {
+        response = await fetch(`${CLOUD_FUNCTION_URL}/refreshToken`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+          signal: AbortSignal.timeout(this.timing.refreshTimeoutMs),
+        });
+      } catch (error) {
+        const err = error as Error & { cause?: { code?: string } };
+        lastFailure = err?.cause?.code ?? err?.name ?? String(error);
+        logToFile(`Token refresh request did not complete: ${lastFailure}`);
+        continue;
+      }
+
+      if (response.ok) {
+        try {
+          const tokens = (await response.json()) as Auth.Credentials;
+          if (tokens?.access_token) return tokens;
+          lastFailure = 'response carried no access token';
+        } catch {
+          lastFailure = 'unparsable response';
+        }
+        logToFile(`Token refresh returned no usable tokens: ${lastFailure}`);
+        continue;
+      }
+
+      const body = await response.text().catch(() => '');
+      if (
+        (response.status === 400 || response.status === 401) &&
+        body.includes('invalid_grant')
+      ) {
+        logToFile('Token refresh rejected by Google: invalid_grant');
+        throw new RefreshGrantRevokedError();
+      }
+      lastFailure = `HTTP ${response.status}`;
+      logToFile(`Token refresh attempt failed: ${lastFailure}`);
+    }
+
+    throw new Error(
+      `Google token refresh is temporarily unavailable (${lastFailure}); stored credentials were kept, retry shortly.`,
+    );
   }
 
   private async getAvailablePort(): Promise<number> {

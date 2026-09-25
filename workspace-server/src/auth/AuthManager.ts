@@ -23,6 +23,8 @@ const CLIENT_ID = config.clientId;
 const CLOUD_FUNCTION_URL = config.cloudFunctionUrl;
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
 
+const CALLBACK_SERVER_MAX_MS = 30 * 60_000;
+
 const LOGIN_TIMEOUT_MESSAGE =
   'User is not authenticated. Authentication timed out after 5 minutes. The user did not complete the login process in the browser. ' +
   'Please ask the user to check their browser and try again.';
@@ -216,8 +218,9 @@ export class AuthManager {
         logToFile(
           `Token cache missing required scopes: ${missingScopes.join(', ')}`,
         );
-        logToFile('Removing cached token to force re-authentication...');
-        await OAuthCredentialStorage.clearCredentials();
+        // Left in place: the next successful sign-in overwrites it, and
+        // deleting it here would lose a grant a sibling process may still use.
+        logToFile('Ignoring the cached token; a new sign-in will replace it.');
         return false;
       } else {
         client.setCredentials(credentials);
@@ -372,6 +375,15 @@ export class AuthManager {
     oAuth2Client: Auth.OAuth2Client,
   ): Promise<Auth.OAuth2Client> {
     const webLogin = await this.authWithWeb(oAuth2Client);
+    // Persist on completion rather than after the race below: a consent the
+    // user finishes after the timeout still lands in storage for the next
+    // call to find, instead of being thrown away.
+    const persisted = webLogin.loginCompletePromise.then(() =>
+      OAuthCredentialStorage.saveCredentials(oAuth2Client.credentials),
+    );
+    persisted.catch((error) => {
+      logToFile(`Sign-in did not complete: ${error}`);
+    });
     await open(webLogin.authUrl);
     const msg = 'Waiting for authentication... Check your browser.';
     logToFile(msg);
@@ -388,12 +400,11 @@ export class AuthManager {
       );
     });
     try {
-      await Promise.race([webLogin.loginCompletePromise, timeoutPromise]);
+      await Promise.race([persisted, timeoutPromise]);
     } finally {
       clearTimeout(timer);
     }
 
-    await OAuthCredentialStorage.saveCredentials(oAuth2Client.credentials);
     this.client = oAuth2Client;
     return this.client;
   }
@@ -739,9 +750,18 @@ export class AuthManager {
         } catch (e) {
           reject(e);
         } finally {
+          clearTimeout(abandonTimer);
           server.close();
         }
       });
+
+      // The callback server outlives the sign-in timeout so a late consent
+      // still lands, but not forever.
+      const abandonTimer = setTimeout(() => {
+        server.close();
+        reject(new Error('OAuth callback was never received; gave up.'));
+      }, CALLBACK_SERVER_MAX_MS);
+      abandonTimer.unref();
 
       server.listen(port, host, () => {
         // Server started successfully

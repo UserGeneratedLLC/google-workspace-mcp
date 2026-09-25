@@ -26,10 +26,18 @@ jest.mock('node:fs', () => ({
   promises: {
     readFile: jest.fn(),
     writeFile: jest.fn(),
+    appendFile: jest.fn(),
+    rename: jest.fn(),
     unlink: jest.fn(),
     mkdir: jest.fn(),
   },
   existsSync: jest.fn(() => true),
+}));
+
+jest.mock('node:child_process', () => ({
+  execFileSync: jest.fn(() => {
+    throw new Error('scutil not available in tests');
+  }),
 }));
 
 jest.mock('node:os', () => ({
@@ -48,6 +56,7 @@ describe('FileTokenStorage', () => {
   const mockFs = fs as unknown as {
     readFile: ReturnType<typeof jest.fn>;
     writeFile: ReturnType<typeof jest.fn>;
+    rename: ReturnType<typeof jest.fn>;
     unlink: ReturnType<typeof jest.fn>;
     mkdir: ReturnType<typeof jest.fn>;
   };
@@ -168,6 +177,7 @@ describe('FileTokenStorage', () => {
       mockFs.readFile.mockResolvedValue(encryptedData);
       mockFs.mkdir.mockResolvedValue(undefined);
       mockFs.writeFile.mockResolvedValue(undefined);
+      mockFs.rename.mockResolvedValue(undefined);
 
       const credentials: OAuthCredentials = {
         serverName: 'test-server',
@@ -187,9 +197,16 @@ describe('FileTokenStorage', () => {
       expect(mockFs.writeFile).toHaveBeenCalled();
 
       const writeCall = mockFs.writeFile.mock.calls[0];
-      expect(writeCall[0]).toBe(ENCRYPTED_TOKEN_PATH);
+      // Writes go to a unique temp file first (atomic-rename save path).
+      expect(writeCall[0]).toMatch(
+        new RegExp(`^${ENCRYPTED_TOKEN_PATH}\\.tmp-`),
+      );
       expect(writeCall[1]).toMatch(/^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/);
       expect(writeCall[2]).toEqual({ mode: 0o600 });
+      expect(mockFs.rename).toHaveBeenCalledWith(
+        writeCall[0],
+        ENCRYPTED_TOKEN_PATH,
+      );
     });
 
     it('should update existing credentials', async () => {

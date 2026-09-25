@@ -31,6 +31,7 @@ coverage/
 token.json
 gemini-cli-workspace-token.json
 .gemini-cli-workspace-master-key
+.gemini-cli-workspace-auth.lock*
 
 commit_message.txt
 
